@@ -1,0 +1,756 @@
+import streamlit as st
+import os
+import requests
+from dotenv import load_dotenv
+from typing import Dict, Optional, Tuple, Union, Any
+from dataclasses import dataclass
+from datetime import datetime
+from pydantic import BaseModel, Field
+import pandas as pd
+from geopy.geocoders import Nominatim
+from datetime import datetime
+from prophet import Prophet
+import matplotlib.pyplot as plt
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+load_dotenv() 
+# -------------------------------------------------------------------
+# 1. Define the Pydantic models for schema validation
+# -------------------------------------------------------------------
+
+class AQIResponse(BaseModel):
+    success: bool
+    data: Dict[str, Any]  # Allow any type of data structure to be returned
+    status: str
+    # Accept either a string or a datetime for expiresAt, since Firecrawl may return a datetime
+    expiresAt: Union[str, datetime]
+
+class DailyAQIMeasurement(BaseModel):
+    date: str = Field(description="Date of the measurement in YYYY-MM-DD format")
+    aqi: float = Field(description="Air Quality Index")
+    pollutant: float = Field(description="Primary pollutant in the air")
+
+class ExtractSchema(BaseModel):
+    measurements: list[DailyAQIMeasurement]
+
+# -------------------------------------------------------------------
+# 2. Define a simple dataclass to hold user inputs
+# -------------------------------------------------------------------
+
+@dataclass
+class UserInput:
+    city: str
+    country: str
+    medical_conditions: Optional[str]
+    planned_activity: str
+
+# -------------------------------------------------------------------
+# 3. AQIAnalyzer: wraps Firecrawl to fetch AQI + related metrics
+# -------------------------------------------------------------------
+
+class AQIAnalyzer:
+
+    def _format_url(self) -> str:
+        """
+        Format the target URL based on location, handling cases with and without state.
+        """
+        return f"https://airquality.googleapis.com/v1/history:lookup?key={os.getenv('API_KEY')}"
+    
+    def get_lat_lon_geopy(self, address):
+        geolocator = Nominatim(user_agent="aqi checker")
+        location = geolocator.geocode(address)
+        if location:
+            return location.latitude, location.longitude
+        else:
+            raise Exception("Location not found")
+
+    def fetch_aqi_data(self, city: str, country: str) -> Tuple[Dict[Any, Any], str]:
+        """
+        Fetch AQI data from the website using Firecrawl. Returns a tuple:
+          (data_dict, info_message)
+        On failure, returns default zeroed metrics + an error message.
+        """
+        try:
+            url = self._format_url()
+            address = f"{city}, {country}"
+            latitude, longitude = self.get_lat_lon_geopy(address)
+            headers = {
+                "Content-Type": "application/json"
+            }
+            body = {
+                "hours": 168,
+                "pageSize": 168,
+                "pageToken":"",
+                "location": {
+                    "latitude": float(latitude),
+                    "longitude": float(longitude)
+                }
+            }
+            response = requests.post(url, headers=headers, json=body)
+
+            if response.status_code == 200:
+                data = response.json()
+                # Process the hours information into measurements
+                measurements = []
+                for hour_info in data["hoursInfo"]:
+                    # Extract the date and time information
+                    date_time = hour_info["dateTime"]
+                    
+                    # Extract AQI and pollutant information
+                    aqi = hour_info.get("indexes", [{}])[0].get("aqi", None) if "indexes" in hour_info and hour_info["indexes"] else None
+                    pollutant = hour_info.get("indexes", [{}])[0].get("dominantPollutant", None) if "indexes" in hour_info and hour_info["indexes"] else None
+                    if aqi is not None:
+                        aqi = round(aqi, 1)
+                    # Parse the timestamp
+                    dt = datetime.strptime(date_time, "%Y-%m-%dT%H:%M:%SZ")
+
+                    # Format to readable string
+                    readable = dt.strftime("%B %d, %Y %I:%M %p UTC")
+
+                    measurements.append({
+                        "date": readable,
+                        "aqi": aqi,
+                        "pollutant": pollutant,
+                    })
+
+                # Organize the data into the expected format
+                data = {
+                    "measurements": measurements
+                }
+
+                return data, "AQI data fetched successfully"
+            else:
+                raise Exception(f"Failed to fetch data: {response.status_code} - {response.text}")
+        except Exception as e:
+            print("Error fetching AQI data:", e)
+            return -1, -1
+
+# -------------------------------------------------------------------
+# 4. HealthRecommendationAgent placeholder
+#    (Replace or implement this class according to your actual logic)
+# -------------------------------------------------------------------
+
+class HealthRecommendationAgent:
+    """
+    A placeholder agent that, in reality, should use OpenAIChat (or similar)
+    to generate personalized health recommendations based on AQI + user profile.
+
+    In production, replace the get_recommendations method with your own logic,
+    using OpenAIChat or Agno's agent system.
+    """
+
+
+    def get_recommendations(
+        self, current_aqi: str, user_input: UserInput
+    ) -> str:
+        """
+        Build a prompt from aqi_data + user_input, send to LLM, and return the answer.
+        For now, we'll return a very basic, hardcoded recommendation string.
+        """
+        model = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            max_completion_tokens=None,
+            google_api_key=os.getenv("GOOGLE_API_KEY"),
+            temperature=1
+        )
+
+        # Format the user input into a string representation
+        user_input_str = (
+            f"City: {user_input.city}, Country: {user_input.country}\n"
+            f"Medical Conditions: {user_input.medical_conditions if user_input.medical_conditions else 'None'}\n"
+            f"Planned Activity: {user_input.planned_activity}"
+        )
+
+        template = PromptTemplate(
+            input_variables=["current_aqi", "user_input"],
+            template="""
+            Using the current AQI of {current_aqi} and the user's profile:
+            {user_input}
+            Provide personalized health recommendations for the user.
+
+            """,
+        )
+
+        parser = StrOutputParser()
+
+        chain = template | model | parser
+
+
+        result = chain.invoke({
+            "current_aqi": current_aqi,
+            "user_input": user_input_str
+        })
+        
+        print("Result:", result)
+
+        return result
+# -------------------------------------------------------------------
+# 5. Main analysis function
+# -------------------------------------------------------------------
+
+def analyze_conditions(
+    city: str,
+    country: str,
+    medical_conditions: Optional[str],
+    planned_activity: str,
+) -> Tuple[pd.DataFrame, str, str]:
+    """
+    Given user inputs and API keys, fetch AQI data, generate recommendations,
+    and return four strings:
+      1) JSON-formatted AQI data for display
+      2) Markdown recommendations
+      3) Info/status message
+    """
+    try:
+        # Initialize the AQI analyzer and health recommendation agent
+        aqi_analyzer = AQIAnalyzer()
+        health_agent = HealthRecommendationAgent()
+
+        # Bundle user input into the dataclass
+        user_input = UserInput(
+            city=city.strip(),
+            country=country.strip(),
+            medical_conditions=medical_conditions.strip() if medical_conditions else None,
+            planned_activity=planned_activity.strip(),
+        )
+
+        # 1. Fetch AQI data + related data
+        aqi_data, info_msg = aqi_analyzer.fetch_aqi_data(
+            city=user_input.city,
+            country=user_input.country,
+        )
+        
+        # Check if data fetching failed
+        if aqi_data == -1 and info_msg == -1:
+            return pd.DataFrame(), "Unable to retrieve AQI data", f"No AQI data found for {city}, {country}. Please check the city and country names and try again."
+
+        # 2. Format the raw numbers into a JSON string for display
+        # Create DataFrame from the measurements list
+        if "measurements" in aqi_data and isinstance(aqi_data["measurements"], list):
+            df = pd.DataFrame(aqi_data["measurements"])
+            # Rename columns for better readability
+            df.rename(columns={
+                "aqi": "Air Quality Index (AQI)",
+                "pollutant": "Primary Pollutant",
+            }, inplace=True)
+        
+        print("AQI:", df)
+        current_aqi = df['Air Quality Index (AQI)'].iloc[167]
+        print("Current AQI:", current_aqi)
+        recommendations = health_agent.get_recommendations(current_aqi, user_input)
+        print("AQI:", df)
+        df = df[::-1].reset_index(drop=True)  # Reverse the DataFrame order
+        print("AQI:", df)
+        return df, recommendations, info_msg
+
+    except Exception as e:
+        error_msg = f"Error occurred during analysis: {str(e)}"
+        print("NO")
+        return pd.DataFrame(), "Analysis failed", error_msg
+
+
+def makePrediction(df :pd.DataFrame) -> tuple[plt.Figure, pd.DataFrame]:
+    model = Prophet(
+        daily_seasonality=True,
+        weekly_seasonality=False,
+        seasonality_mode='additive'
+    )
+
+    df.rename(columns={'date': 'ds', 'Air Quality Index (AQI)': 'y'}, inplace=True)
+
+    #remove UTC from the date column
+    df['ds'] = pd.to_datetime(df['ds']).dt.tz_localize(None)
+
+    model.fit(df)
+
+    future = model.make_future_dataframe(periods=24, freq='H') 
+    forecast = model.predict(future)
+
+    forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(24)
+
+    
+    return forecast
+    
+df, recommendations, info_msg = analyze_conditions(
+    city="Mumbai",
+    country="India",
+    medical_conditions=None,
+    planned_activity="Swimming for 1 hour"
+)
+
+print(df.head())
+    
+# -------------------------------------------------------------------
+# 6. Streamlit interface
+# -------------------------------------------------------------------
+
+def main():
+    # Set page configuration
+    st.set_page_config(
+        page_title="AQI Health Advisor",
+        page_icon="🌬️",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Add custom CSS for styling
+    st.markdown("""
+        <style>
+        .main-header {
+            font-size: 2.5rem;
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 1rem;
+        }
+        .sub-header {
+            font-size: 1.5rem;
+            color: #34495e;
+            margin-bottom: 1rem;
+        }
+        .info-text {
+            font-size: 1rem;
+            color: #7f8c8d;
+        }
+        .warning {
+            background-color: #fff3cd;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border-left: 0.5rem solid #ffc107;
+            margin: 1rem 0;
+        }
+        .card {
+            background-color: green;
+            padding: 1.5rem;
+            border-radius: 0.5rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 1rem;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # App header
+    st.markdown("<h1 class='main-header'>AQI Health Advisor</h1>", unsafe_allow_html=True)
+    st.markdown("<p class='info-text'>Get personalized air quality insights and health recommendations based on your location and planned activities.</p>", unsafe_allow_html=True)
+    
+    # Sidebar for user inputs
+    with st.sidebar:
+        st.markdown("<h2 class='sub-header'>Your Information</h2>", unsafe_allow_html=True)
+        
+        # Create a form for user inputs
+        with st.form("user_input_form"):
+            city = st.text_input("City", placeholder="E.g. Mumbai")
+            country = st.text_input("Country", placeholder="E.g. India")
+            medical_conditions = st.text_area("Medical Conditions (if any)", 
+                                             placeholder="E.g., asthma, allergies, etc.")
+            planned_activity = st.text_input("Planned Activity", 
+                                           placeholder="E.g., jogging, hiking, etc.",)
+            
+            submit_button = st.form_submit_button("Get AQI Analysis")
+    
+    # Initialize session state for storing results
+    if 'results' not in st.session_state:
+        st.session_state.results = None
+    
+    # Process the form submission
+    if submit_button:
+        with st.spinner("Analyzing air quality data..."):
+            try:
+                df, recommendations, info_msg = analyze_conditions(
+                    city=city,
+                    country=country,
+                    medical_conditions=medical_conditions,
+                    planned_activity=planned_activity,
+                )
+                
+                # Check if we got an error message about invalid location
+                if "No AQI data found for" in info_msg:
+                    st.error(info_msg)
+                    st.warning("Please try a different city or check the spelling of your location.")
+                    st.session_state.results = None
+                else:
+                    # Store results in session state
+                    st.session_state.results = {
+                        'df': df.copy(),
+                        'recommendations': recommendations,
+                        'info_msg': info_msg
+                    }
+                    
+                    st.success("Analysis completed successfully!")
+            except Exception as e:
+                st.error(f"Error occurred: {str(e)}")
+                st.warning("Please try a different city or check your network connection.")
+                st.session_state.results = None
+    
+    # Display results if available
+    if st.session_state.results:
+        results = st.session_state.results
+        df = results['df']
+        recommendations = results['recommendations']
+        info_msg = results['info_msg']
+        
+        # Create tabs for different sections
+        tab1, tab2, tab3 = st.tabs(["AQI Prediction", "Health Recommendations", "Historical Data"])
+        
+        with tab1:
+            st.markdown("<h2 class='sub-header'>24-Hour AQI Prediction</h2>", unsafe_allow_html=True)
+            # Add explanatory content about AQI prediction
+            # Display location info
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"<div class='card'><h3>Location</h3><p>{city}, {country}</p></div>", unsafe_allow_html=True)
+            with col2:
+                st.markdown(f"<div class='card'><h3>Activity</h3><p>{planned_activity}</p></div>", unsafe_allow_html=True)
+            
+            # Make and display prediction chart
+            if not df.empty:
+                # Clone the dataframe to avoid modifying the original
+                prediction_df = df.copy()
+                
+                try:
+                    forecast = makePrediction(prediction_df)
+                    # Extract forecast data for the next 24 hours
+                    forecast_table = forecast.tail(24)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
+                    forecast_table['ds'] = forecast_table['ds'].dt.strftime('%Y-%m-%d %H:%M')
+                    
+                    # Rename columns for better readability
+                    forecast_table = forecast_table.rename(columns={
+                        'ds': 'Date & Time(UTC)',
+                        'yhat': 'Predicted AQI',
+                        'yhat_lower': 'Low Estimate',
+                        'yhat_upper': 'High Estimate'
+                    })
+                    
+                    # Round values to 1 decimal place
+                    for col in ['Predicted AQI', 'Low Estimate', 'High Estimate']:
+                        forecast_table[col] = forecast_table[col].round(1)
+                    
+                    # Define a function to color-code the AQI values
+                    def color_aqi(val):
+                        if pd.isna(val):
+                            return ''
+                        try:
+                            val = float(val)
+                        except:
+                            return ''
+                        if 80 <= val <= 100:
+                            color = '#009E3A'      # 100 - 80
+                        elif 60 <= val < 80:
+                            color = '#84CF33'      # 79 - 60
+                        elif 40 <= val < 60:
+                            color = '#FFFF00'      # 59 - 40
+                        elif 20 <= val < 40:
+                            color = '#FF8C00'      # 39 - 20
+                        elif 1 <= val < 20:
+                            color = '#FF0000'      # 19 - 1
+                        elif val == 0:
+                            color = '#800000'      # 0
+                        else:
+                            color = ''
+                        return f'color: {color}; font-weight: bold;'
+                    
+                    # Apply styling and display the table
+                    st.markdown("<h3>24-Hour AQI Forecast</h3>", unsafe_allow_html=True)
+                    st.dataframe(
+                        forecast_table.style.applymap(color_aqi, subset=['Predicted AQI', 'Low Estimate', 'High Estimate']),
+                        use_container_width=True,
+                        height=500,  # Make the table larger
+                        hide_index=True  # Hide row indices
+                    )
+                    
+                    st.markdown("<p class='info-text'>The table shows predicted Air Quality Index (AQI) for the next 24 hours. Higher values (green) indicate better air quality, while lower values (red) indicate worse air quality. The values in the chart use the Universal Air Quality Index(UAQI). </p>", unsafe_allow_html=True)
+                except Exception as e:
+                    st.error(f"Error generating prediction: {str(e)}")
+            else:
+                st.warning("Insufficient data to make predictions.")
+        
+        with tab2:
+            st.markdown("<h2 class='sub-header'>Health Recommendations</h2>", unsafe_allow_html=True)
+            
+            # Display the recommendations in a nicely formatted card
+            st.markdown(f"<div class='card'>{recommendations.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
+            # Add medical condition specific advice if provided
+            if medical_conditions:
+                st.markdown("<h3>Medical Condition Considerations</h3>", unsafe_allow_html=True)
+                
+                # Create a dictionary of common conditions and specific advice
+                condition_advice = {
+                    "asthma": """
+                        <div class='card'>
+                            <h4>Asthma Management</h4>
+                            <ul>
+                                <li>Keep your rescue inhaler with you at all times</li>
+                                <li>Consider using a preventative inhaler before outdoor activities</li>
+                                <li>Monitor your peak flow readings more frequently</li>
+                                <li>Stay hydrated to keep airways moist</li>
+                            </ul>
+                        </div>
+                    """,
+                    "allergies": """
+                        <div class='card'>
+                            <h4>Allergy Management</h4>
+                            <ul>
+                                <li>Consider taking antihistamines before outdoor exposure</li>
+                                <li>Wear sunglasses to protect eyes from irritants</li>
+                                <li>Shower after outdoor activities to remove allergens</li>
+                                <li>Consider a saline nasal rinse to clear irritants</li>
+                            </ul>
+                        </div>
+                    """,
+                    "copd": """
+                        <div class='card'>
+                            <h4>COPD Management</h4>
+                            <ul>
+                                <li>Limit outdoor exposure when AQI is elevated</li>
+                                <li>Use prescribed oxygen as directed</li>
+                                <li>Practice pursed-lip breathing techniques</li>
+                                <li>Stay current with vaccinations</li>
+                            </ul>
+                        </div>
+                    """
+                }
+                
+                # Display relevant advice based on keywords in medical conditions
+                displayed_advice = False
+                for condition, advice in condition_advice.items():
+                    if condition in medical_conditions.lower():
+                        st.markdown(advice, unsafe_allow_html=True)
+                        displayed_advice = True
+                
+                # If no specific advice matched, provide general advice
+                if not displayed_advice:
+                    st.markdown("""
+                        <div class='card'>
+                            <h4>General Health Considerations</h4>
+                            <p>With your mentioned medical conditions, consider:</p>
+                            <ul>
+                                <li>Carrying all necessary medications</li>
+                                <li>Informing companions about your condition</li>
+                                <li>Taking more frequent breaks during activities</li>
+                                <li>Monitoring your symptoms closely</li>
+                                <li>Having a plan in case symptoms worsen</li>
+                            </ul>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+            # Add nutrition and hydration advice
+            st.markdown("<h3>Nutrition & Hydration Tips</h3>", unsafe_allow_html=True)
+            st.markdown("""
+                <div class='card'>
+                    <h4>Foods that may help combat air pollution effects:</h4>
+                    <ul>
+                        <li><strong>Antioxidant-rich foods:</strong> Berries, dark leafy greens, and colorful vegetables</li>
+                        <li><strong>Omega-3 sources:</strong> Fatty fish, walnuts, and flaxseeds to reduce inflammation</li>
+                        <li><strong>Vitamin C:</strong> Citrus fruits, bell peppers, and broccoli to boost immune function</li>
+                        <li><strong>Vitamin E:</strong> Nuts, seeds, and olive oil to protect cells from oxidative damage</li>
+                    </ul>
+                    <h4>Hydration guidelines:</h4>
+                    <ul>
+                        <li>Drink 16-20 oz of water 2 hours before outdoor activity</li>
+                        <li>Consume 7-10 oz of fluid every 10-20 minutes during activity</li>
+                        <li>Consider electrolyte drinks for activities longer than 60 minutes</li>
+                    </ul>
+                </div>
+            """, unsafe_allow_html=True)
+            # Add some general advice based on AQI levels
+            if not df.empty and 'Air Quality Index (AQI)' in df.columns:
+                current_aqi = df['Air Quality Index (AQI)'].iloc[167]
+                st.markdown("<h3>General Precautions</h3>", unsafe_allow_html=True)
+                
+                if current_aqi >= 80 and current_aqi <= 100:
+                    bg_color = "#009E3A"
+                    st.markdown(f"""
+                        <div class='warning' style="background: linear-gradient(to right, {bg_color}, {bg_color}CC); color: white; border-left: 0.5rem solid #007D2E;">
+                            <h4>✅ Excellent Air Quality (AQI: {current_aqi:.1f})</h4>
+                            <p>Current air quality is excellent. Enjoy your outdoor activities!</p>
+                            <ul>
+                                <li>Perfect conditions for your planned activity</li>
+                                <li>Stay hydrated</li>
+                                <li>Enjoy the fresh air</li>
+                            </ul>
+                        </div>
+                    """, unsafe_allow_html=True)
+                elif current_aqi >= 60 and current_aqi < 80:
+                    bg_color = "#84CF33"
+                    st.markdown(f"""
+                        <div class='warning' style="background: linear-gradient(to right, {bg_color}, {bg_color}CC); color: white; border-left: 0.5rem solid #6BAA29;">
+                            <h4>✅ Good Air Quality (AQI: {current_aqi:.1f})</h4>
+                            <p>Current air quality is good. Proceed with your outdoor plans.</p>
+                            <ul>
+                                <li>Good conditions for outdoor activities</li>
+                                <li>Stay hydrated</li>
+                                <li>Monitor how you feel during activity</li>
+                            </ul>
+                        </div>
+                    """, unsafe_allow_html=True)
+                elif current_aqi >= 40 and current_aqi < 60:
+                    bg_color = "#FFFF00"
+                    st.markdown(f"""
+                        <div class='warning' style="background: linear-gradient(to right, {bg_color}, {bg_color}CC); color: black; border-left: 0.5rem solid #CCCC00;">
+                            <h4>⚠️ Moderate Air Quality (AQI: {current_aqi:.1f})</h4>
+                            <p>Current air quality is moderate. Some precautions recommended.</p>
+                            <ul>
+                                <li>Sensitive individuals should take breaks as needed</li>
+                                <li>Stay well hydrated</li>
+                                <li>Monitor any symptoms if you have pre-existing conditions</li>
+                            </ul>
+                        </div>
+                    """, unsafe_allow_html=True)
+                elif current_aqi >= 20 and current_aqi < 40:
+                    bg_color = "#FF8C00"
+                    st.markdown(f"""
+                        <div class='warning' style="background: linear-gradient(to right, {bg_color}, {bg_color}CC); color: white; border-left: 0.5rem solid #CC7000;">
+                            <h4>⚠️ Low Air Quality (AQI: {current_aqi:.1f})</h4>
+                            <p>Current air quality is low. Take precautions.</p>
+                            <ul>
+                                <li>Consider reducing intensity of outdoor activities</li>
+                                <li>Take frequent breaks</li>
+                                <li>Consider a mask if you have respiratory issues</li>
+                                <li>Stay well hydrated</li>
+                                <li>Monitor symptoms closely</li>
+                            </ul>
+                        </div>
+                    """, unsafe_allow_html=True)
+                elif current_aqi >= 1 and current_aqi < 20:
+                    bg_color = "#FF0000"
+                    st.markdown(f"""
+                        <div class='warning' style="background: linear-gradient(to right, {bg_color}, {bg_color}CC); color: white; border-left: 0.5rem solid #CC0000;">
+                            <h4>🚫 Poor Air Quality (AQI: {current_aqi:.1f})</h4>
+                            <p>Current air quality is poor. Significant precautions advised.</p>
+                            <ul>
+                                <li>Consider wearing an N95 mask outdoors</li>
+                                <li>Limit outdoor exposure when possible</li>
+                                <li>Keep windows closed</li>
+                                <li>Use air purifiers indoors</li>
+                                <li>Consider rescheduling strenuous outdoor activities</li>
+                            </ul>
+                        </div>
+                    """, unsafe_allow_html=True)
+                elif current_aqi == 0:
+                    bg_color = "#800000"
+                    st.markdown(f"""
+                        <div class='warning' style="background: linear-gradient(to right, {bg_color}, {bg_color}CC); color: white; border-left: 0.5rem solid #660000;">
+                            <h4>🚫 Very Poor Air Quality (AQI: {current_aqi:.1f})</h4>
+                            <p>Current air quality is very poor. Strong precautions advised.</p>
+                            <ul>
+                                <li>Wear an N95 mask if outdoor activity is necessary</li>
+                                <li>Stay indoors as much as possible</li>
+                                <li>Keep all windows closed</li>
+                                <li>Use air purifiers</li>
+                                <li>Strongly consider postponing outdoor activities</li>
+                            </ul>
+                        </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    # Default for any other value
+                    bg_color = "#3498db"
+                    st.markdown(f"""
+                        <div class='card' style="background: linear-gradient(to right, {bg_color}, {bg_color}CC); color: white;">
+                            <h4>Air Quality (AQI: {current_aqi:.1f})</h4>
+                            <p>Current air quality information. Enjoy your outdoor activities while staying hydrated and being mindful of your body's signals.</p>
+                        </div>
+                    """, unsafe_allow_html=True)
+        with tab3:
+            st.markdown("<h2 class='sub-header'>Historical AQI Data</h2>", unsafe_allow_html=True)
+            
+            if not df.empty:
+                # Display the historical data in a nice table
+                display_df = df.copy()
+                # Format the dataframe for better display
+                if 'ds' in display_df.columns:
+                    display_df.rename(columns={'ds': 'Date'}, inplace=True)
+                print(display_df)
+                # Add a visualization of the historical data
+                st.subheader("AQI Trend")
+                if 'Air Quality Index (AQI)' in display_df.columns and not display_df.empty:
+                    chart_data = display_df[['date', 'Air Quality Index (AQI)']]
+                    chart_data = chart_data.dropna()
+                    if not chart_data.empty:
+                        # Convert date strings to datetime objects for proper chronological ordering
+                        chart_data['date'] = pd.to_datetime(chart_data['date'])
+                        # Sort by date to ensure chronological order
+                        chart_data = chart_data.sort_values('date')
+                        #convert datetime to string for display
+                        chart_data['date'] = chart_data['date'].dt.strftime('%Y-%m-%d %H:%M')
+                        st.line_chart(chart_data.set_index('date')['Air Quality Index (AQI)'])
+                    
+                    # Add summary statistics
+                    st.subheader("AQI Statistics")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        avg_aqi = display_df['Air Quality Index (AQI)'].mean()
+                        avg_color = color_aqi(avg_aqi)
+                        st.markdown(
+                            f"""
+                            <div style="padding: 1rem; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);">
+                                <div style="font-size: 0.875rem; color: rgb(100, 116, 139);">Average AQI</div>
+                                <div style="font-size: 1.875rem; {avg_color};">{avg_aqi:.1f}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                        #st.metric("Average AQI", f"{avg_aqi:.1f}")
+                    with col2:
+                        max_aqi = display_df['Air Quality Index (AQI)'].max()
+                        max_color = color_aqi(max_aqi)
+                        st.markdown(
+                            f"""
+                            <div style="padding: 1rem; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);">
+                                <div style="font-size: 0.875rem; color: rgb(100, 116, 139);">Maximum AQI</div>
+                                <div style="font-size: 1.875rem; {max_color};">{max_aqi:.1f}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                    with col3:
+                        min_aqi = display_df['Air Quality Index (AQI)'].min()
+                        min_color = color_aqi(min_aqi)
+                        st.markdown(
+                            f"""
+                            <div style="padding: 1rem; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);">
+                                <div style="font-size: 0.875rem; color: rgb(100, 116, 139);">Minimum AQI</div>
+                                <div style="font-size: 1.875rem; {min_color};">{min_aqi:.1f}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                if 'y' in display_df.columns:
+                    display_df.rename(columns={'y': 'Air Quality Index (AQI)'}, inplace=True)
+                
+                st.dataframe(
+                    display_df.style.applymap(color_aqi, subset=['Air Quality Index (AQI)']),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # Add a download button for the data
+                csv = display_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="Download Data as CSV",
+                    data=csv,
+                    file_name=f"aqi_data_{city}_{country}.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("No historical data available.")
+
+if __name__ == "__main__":
+    main()
+
+
+# baseline2.py
+# Suggestions : 
+# 1. Predict AQI for a week (7 days) : cache most recent AQI
+# 2. if AQI = bad, send warning  : wear mask (define in the prompt)
+# 2a. cross selling basis the AQI : recommendation engine
+# 3. Suggest what to eat/drink before planned activity (defined in the prompt)
+# 3a. suggest eat/drink : Remedy : supplements.
+# 4. = 2 + 2a : integrate temp (C and F) , send notifications with threshold
+# 5. Real time AQI map -
+# 
+# prompt template
+# export the prompts from py to json
+# template.json fetching all the prompts
+# convert the AQI data into a dataframe using pandas
+# API key: fc-e9becbccaaca494a9e62a1ce709431ec
