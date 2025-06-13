@@ -415,6 +415,9 @@ def main():
     # Process the form submission
     if submit_button:
         with st.spinner("Analyzing air quality data..."):
+            # Reset mask recommendations when a new search is performed
+            st.session_state.mask_recommendations = None
+            
             try:
                 df, recommendations, info_msg = analyze_conditions(
                     city=city,
@@ -423,13 +426,11 @@ def main():
                     planned_activity=planned_activity,
                 )
                 
-                # Check if we got an error message about invalid location
                 if "No AQI data found for" in info_msg:
                     st.error(info_msg)
                     st.warning("Please try a different city or check the spelling of your location.")
                     st.session_state.results = None
                 else:
-                    # Store results in session state
                     st.session_state.results = {
                         'df': df.copy(),
                         'recommendations': recommendations,
