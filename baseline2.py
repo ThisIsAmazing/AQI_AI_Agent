@@ -14,6 +14,10 @@ import matplotlib.pyplot as plt
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chat_models import ChatLiteLLM
+from crewai.tools import tool
+from langchain_community.tools import DuckDuckGoSearchResults
+from crewai import Agent, Task, Crew, Process
 
 load_dotenv() 
 # -------------------------------------------------------------------
@@ -124,7 +128,6 @@ class AQIAnalyzer:
             else:
                 raise Exception(f"Failed to fetch data: {response.status_code} - {response.text}")
         except Exception as e:
-            print("Error fetching AQI data:", e)
             return -1, -1
 
 # -------------------------------------------------------------------
@@ -177,13 +180,10 @@ class HealthRecommendationAgent:
 
         chain = template | model | parser
 
-
         result = chain.invoke({
             "current_aqi": current_aqi,
             "user_input": user_input_str
         })
-        
-        print("Result:", result)
 
         return result
 # -------------------------------------------------------------------
@@ -236,20 +236,18 @@ def analyze_conditions(
                 "pollutant": "Primary Pollutant",
             }, inplace=True)
         
-        print("AQI:", df)
         current_aqi = df['Air Quality Index (AQI)'].iloc[167]
-        print("Current AQI:", current_aqi)
         recommendations = health_agent.get_recommendations(current_aqi, user_input)
-        print("AQI:", df)
         df = df[::-1].reset_index(drop=True)  # Reverse the DataFrame order
-        print("AQI:", df)
         return df, recommendations, info_msg
 
     except Exception as e:
         error_msg = f"Error occurred during analysis: {str(e)}"
-        print("NO")
         return pd.DataFrame(), "Analysis failed", error_msg
 
+# -------------------------------------------------------------------
+# 6. Prediction function
+# -------------------------------------------------------------------
 
 def makePrediction(df :pd.DataFrame) -> tuple[plt.Figure, pd.DataFrame]:
     model = Prophet(
@@ -272,18 +270,64 @@ def makePrediction(df :pd.DataFrame) -> tuple[plt.Figure, pd.DataFrame]:
 
     
     return forecast
+
+
+# -------------------------------------------------------------------
+# 7. AI Agents
+# -------------------------------------------------------------------   
     
-df, recommendations, info_msg = analyze_conditions(
-    city="Mumbai",
-    country="India",
-    medical_conditions=None,
-    planned_activity="Swimming for 1 hour"
+@tool
+def search_web_tool(query: str):
+    """
+    Search the web using DuckDuckGo and return the results.
+
+    This tool uses DuckDuckGoSearchResults to perform a web search based on the provided query
+    and returns the top 10 search results.
+
+    Args:
+        query (str): The search query to be submitted to DuckDuckGo.
+
+    Returns:
+        The search results from DuckDuckGo. The exact format depends on the DuckDuckGoSearchResults
+        implementation, but typically includes titles, links, and snippets of the search results.
+    """
+    search_tool = DuckDuckGoSearchResults(num_results=10, verbose=True)
+    return search_tool.run(query)
+
+mask_finder = Agent(
+    role="Mask Finder",
+    goal="Find the best mask for air quality protection",
+    backstory="""You are an expert in air quality protection and can find the best masks for users based on their needs.""",
+    tools=[search_web_tool],
+    max_iter=5,
+    llm=ChatLiteLLM(model="gemini/gemini-2.0-flash", temperature=1, api_key=os.getenv("GOOGLE_API_KEY")),
+    allow_delegation=False
 )
 
-print(df.head())
-    
+mask_task = Task(
+    description="Find the best mask for air quality protection",
+    expected_output="A list of recommended masks with links to purchase them.",
+    agent=mask_finder
+)
+
+crew = Crew(
+    agents=[mask_finder],
+    tasks=[mask_task],
+    process = Process.sequential,
+    full_output=True,
+    share_crew=False,
+)
+
+def get_mask_recommendations():
+    """
+    Run the AI agent crew to get mask recommendations based on air quality.
+    Returns the crew's result.
+    """
+    result = crew.kickoff()
+    return result
+
 # -------------------------------------------------------------------
-# 6. Streamlit interface
+# 8. Streamlit interface
 # -------------------------------------------------------------------
 
 def main():
@@ -327,6 +371,14 @@ def main():
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
             margin-bottom: 1rem;
         }
+        .mask-card {
+            background-color: #3498db;
+            padding: 1.5rem;
+            border-radius: 0.5rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 1rem;
+            border-left: 0.5rem solid #3498db;
+        }
         </style>
     """, unsafe_allow_html=True)
     
@@ -353,6 +405,13 @@ def main():
     if 'results' not in st.session_state:
         st.session_state.results = None
     
+    if 'mask_recommendations' not in st.session_state:
+        st.session_state.mask_recommendations = None
+    
+    # Add this before any tab-related code
+    if 'current_tab' not in st.session_state:
+        st.session_state.current_tab = 0  # Default to first tab
+
     # Process the form submission
     if submit_button:
         with st.spinner("Analyzing air quality data..."):
@@ -391,11 +450,11 @@ def main():
         info_msg = results['info_msg']
         
         # Create tabs for different sections
-        tab1, tab2, tab3 = st.tabs(["AQI Prediction", "Health Recommendations", "Historical Data"])
+        tab1, tab2, tab3, tab4 = st.tabs(["AQI Information", "Health Recommendations", "Mask Recommendations", "Historical AQI Data"])
         
+        # Tab 1 - AQI Information
         with tab1:
-            st.markdown("<h2 class='sub-header'>24-Hour AQI Prediction</h2>", unsafe_allow_html=True)
-            # Add explanatory content about AQI prediction
+            st.header("AQI Information")
             # Display location info
             col1, col2 = st.columns(2)
             with col1:
@@ -465,8 +524,9 @@ def main():
             else:
                 st.warning("Insufficient data to make predictions.")
         
+        # Tab 2 - Health Recommendations
         with tab2:
-            st.markdown("<h2 class='sub-header'>Health Recommendations</h2>", unsafe_allow_html=True)
+            st.header("Health Recommendations")
             
             # Display the recommendations in a nicely formatted card
             st.markdown(f"<div class='card'>{recommendations.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
@@ -612,7 +672,7 @@ def main():
                             </ul>
                         </div>
                     """, unsafe_allow_html=True)
-                elif current_aqi >= 1 and current_aqi < 20:
+                elif current_aqi >= 0 and current_aqi < 20:
                     bg_color = "#FF0000"
                     st.markdown(f"""
                         <div class='warning' style="background: linear-gradient(to right, {bg_color}, {bg_color}CC); color: white; border-left: 0.5rem solid #CC0000;">
@@ -651,8 +711,126 @@ def main():
                             <p>Current air quality information. Enjoy your outdoor activities while staying hydrated and being mindful of your body's signals.</p>
                         </div>
                     """, unsafe_allow_html=True)
+        
+        # Tab 3 - Mask Recommendations
         with tab3:
-            st.markdown("<h2 class='sub-header'>Historical AQI Data</h2>", unsafe_allow_html=True)
+            st.header("Mask Recommendations")
+            
+            # Check if we already have mask recommendations in session state
+            if st.session_state.mask_recommendations is None:
+                mask_btn = st.button("Get Mask Recommendations")
+                
+                if mask_btn:
+                    with st.spinner("Our AI agent is finding the best masks for air quality protection..."):
+                        try:
+                            # Get current AQI for context
+                            current_aqi = df['Air Quality Index (AQI)'].iloc[167] if not df.empty and 'Air Quality Index (AQI)' in df.columns else "unknown"
+                            
+                            # Run the agent to get mask recommendations
+                            mask_results = get_mask_recommendations()
+                            
+                            # Store in session state
+                            st.session_state.mask_recommendations = {
+                                'results': mask_results,
+                                'aqi': current_aqi
+                            }
+                            
+                            st.success("Mask recommendations generated successfully!")
+                        except Exception as e:
+                            st.error(f"Error generating mask recommendations: {str(e)}")
+            
+            # Display mask recommendations if available
+            if st.session_state.mask_recommendations:
+                mask_data = st.session_state.mask_recommendations
+                current_aqi = mask_data['aqi']
+                mask_results = mask_data['results']
+                
+                # Display intro based on AQI level
+                if current_aqi != "unknown":
+                    if current_aqi < 60:  # Moderate or worse AQI
+                        st.markdown(f"""
+                            <div class='warning' style="background-color: #dc3545; border-left: 0.5rem solid #dc3545;">
+                                <h4>🚨 Mask Recommended</h4>
+                                <p>With the current AQI of {current_aqi:.1f}, wearing a mask during outdoor activities is recommended, 
+                                especially if you have respiratory conditions or plan extended outdoor exposure.</p>
+                            </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                            <div class='warning' style="background-color: #198754; border-left: 0.5rem solid #198754;">
+                                <h4>✅ Masks Optional</h4>
+                                <p>With the current AQI of {current_aqi:.1f}, masks are generally optional for most people. 
+                                However, if you have respiratory conditions or are particularly sensitive to air pollution, 
+                                consider using a mask during extended outdoor activities.</p>
+                            </div>
+                        """, unsafe_allow_html=True)
+                
+                # Display the AI agent's recommendations
+                st.markdown("<h3>Expert Mask Recommendations</h3>", unsafe_allow_html=True)
+                
+                # Format and display the results from the agent
+                st.markdown(f"""
+                    <div class='mask-card'>
+                        {str(mask_results).replace(chr(10), '<br>')}
+                    </div>
+                """, unsafe_allow_html=True)
+                
+                # Additional general mask info
+                st.markdown("<h3>Mask Types for Air Quality Protection</h3>", unsafe_allow_html=True)
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("""
+                        <div class='mask-card'>
+                            <h4>N95 Respirators</h4>
+                            <p><strong>Filtration:</strong> 95% of airborne particles</p>
+                            <p><strong>Best for:</strong> High pollution days, wildfire smoke</p>
+                            <p><strong>Features:</strong> Tight seal, NIOSH certified</p>
+                            <p><strong>Limitations:</strong> Can be uncomfortable for long use, requires proper fitting</p>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                with col2:
+                    st.markdown("""
+                        <div class='mask-card'>
+                            <h4>KN95 Masks</h4>
+                            <p><strong>Filtration:</strong> 95% of airborne particles</p>
+                            <p><strong>Best for:</strong> Daily use in polluted areas</p>
+                            <p><strong>Features:</strong> Generally more comfortable than N95</p>
+                            <p><strong>Limitations:</strong> Quality can vary between manufacturers</p>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                with col3:
+                    st.markdown("""
+                        <div class='mask-card'>
+                            <h4>Surgical Masks</h4>
+                            <p><strong>Filtration:</strong> Moderate protection</p>
+                            <p><strong>Best for:</strong> Light pollution, casual use</p>
+                            <p><strong>Features:</strong> Lightweight, comfortable</p>
+                            <p><strong>Limitations:</strong> Less effective for fine particles</p>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                # Mask care tips
+                st.markdown("<h3>Mask Care & Usage Tips</h3>", unsafe_allow_html=True)
+                st.markdown("""
+                    <div class='mask-card'>
+                        <ul>
+                            <li><strong>Proper Fit:</strong> Ensure the mask creates a seal around your nose and mouth</li>
+                            <li><strong>Replacement:</strong> Replace disposable masks after each use or when they become damp/dirty</li>
+                            <li><strong>Reusable Masks:</strong> Wash cloth masks after each use</li>
+                            <li><strong>Storage:</strong> Store clean masks in a breathable container when not in use</li>
+                            <li><strong>Hand Hygiene:</strong> Wash hands before putting on and after removing your mask</li>
+                        </ul>
+                    </div>
+                """, unsafe_allow_html=True)
+            else:
+                if not mask_btn:
+                    st.info("Click the 'Get Mask Recommendations' button to receive personalized mask recommendations from our AI agent.")
+        with tab4:
+            st.header("Historical AQI Data")
             
             if not df.empty:
                 # Display the historical data in a nice table
@@ -660,7 +838,6 @@ def main():
                 # Format the dataframe for better display
                 if 'ds' in display_df.columns:
                     display_df.rename(columns={'ds': 'Date'}, inplace=True)
-                print(display_df)
                 # Add a visualization of the historical data
                 st.subheader("AQI Trend")
                 if 'Air Quality Index (AQI)' in display_df.columns and not display_df.empty:
@@ -734,7 +911,7 @@ def main():
                 )
             else:
                 st.info("No historical data available.")
-
+        
 if __name__ == "__main__":
     main()
 
